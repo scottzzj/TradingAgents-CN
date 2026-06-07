@@ -3,10 +3,16 @@
 基于实时行情和财务数据计算PE/PB等指标
 """
 import logging
+import os
 from typing import Optional, Dict, Any
 from datetime import datetime
 
 logger = logging.getLogger(__name__)
+
+
+def _get_configured_database_name() -> str:
+    """读取 app 同步数据所在的 MongoDB 库名，避免估值链路落到旧库。"""
+    return os.getenv("MONGODB_DATABASE_NAME") or os.getenv("MONGODB_DATABASE") or "tradingagents"
 
 
 def calculate_realtime_pe_pb(
@@ -60,7 +66,7 @@ def calculate_realtime_pe_pb(
             logger.debug(f"检测到异步客户端 {client_type}，转换为同步客户端")
             db_client = MongoClient(settings.MONGO_URI)
 
-        db = db_client['tradingagents']
+        db = db_client[_get_configured_database_name()]
         code6 = str(symbol).zfill(6)
 
         logger.info(f"🔍 [实时PE计算] 开始计算股票 {code6}")
@@ -398,7 +404,7 @@ def get_pe_pb_with_fallback(
     logger.info("   💡 说明: 使用Tushare官方PE_TTM，基于昨日收盘价")
 
     try:
-        db = db_client['tradingagents']
+        db = db_client[_get_configured_database_name()]
         code6 = str(symbol).zfill(6)
 
         # 🔥 优先查询 Tushare 数据源
@@ -436,4 +442,3 @@ def get_pe_pb_with_fallback(
 
     logger.error(f"❌ [PE智能策略-全部失败] 无法获取股票 {symbol} 的PE/PB")
     return {}
-

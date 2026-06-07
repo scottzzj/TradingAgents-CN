@@ -170,6 +170,9 @@ class AKShareSyncService:
                     if "symbol" not in basic_data:
                         basic_data["symbol"] = code
 
+                    # AKShare 基础列表没有退市状态字段；能从全市场列表同步到的股票视为可参与定时行情同步。
+                    basic_data.setdefault("list_status", "L")
+
                     # 更新到数据库（使用 code + source 联合查询）
                     try:
                         await self.db.stock_basic_info.update_one(
@@ -263,7 +266,12 @@ class AKShareSyncService:
             if symbols is None:
                 # 从数据库获取所有上市状态的股票代码（排除退市股票）
                 basic_info_cursor = self.db.stock_basic_info.find(
-                    {"list_status": "L"},  # 只获取上市状态的股票
+                    {
+                        "$or": [
+                            {"list_status": "L"},  # 只获取上市状态的股票
+                            {"list_status": {"$exists": False}},  # 兼容历史 AKShare 基础数据
+                        ]
+                    },
                     {"code": 1}
                 )
                 symbols = [doc["code"] async for doc in basic_info_cursor]

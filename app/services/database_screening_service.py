@@ -4,6 +4,13 @@
 """
 
 import logging
+import asyncio
+import contextlib
+import io
+import math
+import re
+import time
+import urllib.request
 from typing import Any, Dict, List, Optional, Tuple
 from datetime import datetime
 
@@ -19,6 +26,13 @@ class DatabaseScreeningService:
     def __init__(self):
         # 使用视图而不是基础信息表，视图已经包含了实时行情数据
         self.collection_name = "stock_screening_view"
+        self._quotes_cache: Dict[str, Any] = {"ts": 0.0, "data": None}
+        self._industry_cache: Dict[str, Any] = {"ts": 0.0, "data": None}
+        self._roe_cache: Dict[str, Any] = {"ts": 0.0, "data": None}
+        self._quotes_cache_ttl = 300
+        self._industry_cache_ttl = 6 * 60 * 60
+        self._roe_cache_ttl = 6 * 60 * 60
+        self._industry_min_usable_count = 1000
         
         # 支持的基础信息字段映射
         self.basic_fields = {
@@ -117,6 +131,7 @@ class DatabaseScreeningService:
         try:
             db = get_mongo_db()
             collection = db[self.collection_name]
+            source_candidates = [source] if source else None
 
             # 🔥 获取数据源优先级配置
             if not source:
@@ -140,53 +155,470 @@ class DatabaseScreeningService:
                     enabled_sources = ['tushare', 'akshare', 'baostock']
                     logger.warning(f"⚠️ [database_screening] 没有启用的数据源，使用默认: {enabled_sources}")
 
-                source = enabled_sources[0] if enabled_sources else 'tushare'
-                logger.info(f"✅ [database_screening] 最终使用的数据源: {source}")
+                source_candidates = enabled_sources or ['tushare', 'akshare', 'baostock']
+                logger.info(f"✅ [database_screening] 数据源候选: {source_candidates}")
 
             # 构建查询条件（现在视图已包含实时行情数据，可以直接查询所有字段）
-            query = await self._build_query(conditions)
-
-            # 🔥 添加数据源筛选
-            query["source"] = source
-
-            logger.info(f"📋 数据库查询条件: {query}")
+            base_query = await self._build_query(conditions)
 
             # 构建排序条件
             sort_conditions = self._build_sort_conditions(order_by)
 
-            # 获取总数
-            total_count = await collection.count_documents(query)
-
-            # 执行查询
-            cursor = collection.find(query)
-
-            # 应用排序
-            if sort_conditions:
-                cursor = cursor.sort(sort_conditions)
-
-            # 应用分页
-            cursor = cursor.skip(offset).limit(limit)
-
-            # 获取结果
+            source_candidates = source_candidates or ['tushare', 'akshare', 'baostock']
             results = []
             codes = []
-            async for doc in cursor:
-                # 转换结果格式
-                result = self._format_result(doc)
-                results.append(result)
-                codes.append(doc.get("code"))
+            total_count = 0
+            selected_source = None
 
-            # 批量查询财务数据（ROE等）- 如果视图中没有包含
+            for candidate in source_candidates:
+                query = dict(base_query)
+                query["source"] = candidate
+                logger.info(f"📋 数据库查询条件: {query}")
+
+                total_count = await collection.count_documents(query)
+                if total_count == 0 and source is None:
+                    logger.info(f"⚠️ [database_screening] 数据源 {candidate} 无结果，尝试下一个数据源")
+                    continue
+
+                cursor = collection.find(query)
+                if sort_conditions:
+                    cursor = cursor.sort(sort_conditions)
+                cursor = cursor.skip(offset).limit(limit)
+
+                results = []
+                codes = []
+                async for doc in cursor:
+                    result = self._format_result(doc)
+                    results.append(result)
+                    codes.append(doc.get("code"))
+
+                selected_source = candidate
+                break
+
             if codes:
                 await self._enrich_with_financial_data(results, codes)
 
-            logger.info(f"✅ 数据库筛选完成: 总数={total_count}, 返回={len(results)}, 数据源={source}")
+            if total_count == 0 and conditions and self._can_use_external_fallback(conditions, order_by):
+                logger.info("🔁 数据库筛选无结果，尝试使用外部实时数据兜底筛选")
+                fallback_results, fallback_total = await self._screen_with_external_fallback(
+                    conditions=conditions,
+                    limit=limit,
+                    offset=offset,
+                    order_by=order_by,
+                    source_candidates=source_candidates,
+                )
+                if fallback_total > 0:
+                    logger.info(f"✅ 外部实时数据兜底筛选完成: 总数={fallback_total}, 返回={len(fallback_results)}")
+                    return fallback_results, fallback_total
+
+            logger.info(f"✅ 数据库筛选完成: 总数={total_count}, 返回={len(results)}, 数据源={selected_source}")
 
             return results, total_count
             
         except Exception as e:
             logger.error(f"❌ 数据库筛选失败: {e}")
             raise Exception(f"数据库筛选失败: {str(e)}")
+
+    def _condition_field(self, condition: Any) -> Optional[str]:
+        return condition.get("field") if isinstance(condition, dict) else getattr(condition, "field", None)
+
+    def _condition_operator(self, condition: Any) -> Optional[str]:
+        op = condition.get("operator") if isinstance(condition, dict) else getattr(condition, "operator", None)
+        return str(op) if op is not None else None
+
+    def _condition_value(self, condition: Any) -> Any:
+        return condition.get("value") if isinstance(condition, dict) else getattr(condition, "value", None)
+
+    def _can_use_external_fallback(
+        self,
+        conditions: List[Dict[str, Any]],
+        order_by: Optional[List[Dict[str, str]]]
+    ) -> bool:
+        """外部兜底只处理页面当前暴露的低成本筛选字段。"""
+        supported_fields = {
+            "industry", "total_mv", "market_cap", "circ_mv",
+            "pe", "pe_ttm", "pb", "pb_mrq", "roe",
+            "pct_chg", "amount", "close", "volume",
+        }
+        for condition in conditions:
+            field = self._condition_field(condition)
+            if field not in supported_fields:
+                return False
+        for order in order_by or []:
+            field = order.get("field")
+            mapped = self.basic_fields.get(field, field)
+            if mapped not in supported_fields:
+                return False
+        return True
+
+    async def _screen_with_external_fallback(
+        self,
+        conditions: List[Dict[str, Any]],
+        limit: int,
+        offset: int,
+        order_by: Optional[List[Dict[str, str]]],
+        source_candidates: List[str],
+    ) -> Tuple[List[Dict[str, Any]], int]:
+        db = get_mongo_db()
+        base_docs = await self._load_base_stock_docs(db, source_candidates)
+        if not base_docs:
+            return [], 0
+
+        fields = {self.basic_fields.get(self._condition_field(c), self._condition_field(c)) for c in conditions}
+        sort_fields = {self.basic_fields.get(o.get("field"), o.get("field")) for o in (order_by or [])}
+        needs_quotes = bool((fields | sort_fields) & {
+            "total_mv", "circ_mv", "pe", "pe_ttm", "pb", "pb_mrq",
+            "pct_chg", "amount", "close", "volume",
+        })
+        # 前端默认按市值排序；兜底路径也拉行情，保证排序和展示字段可用。
+        needs_quotes = needs_quotes or bool(order_by)
+        needs_industry = "industry" in fields
+        needs_roe = "roe" in fields or "roe" in sort_fields
+
+        codes = [doc.get("code") for doc in base_docs if doc.get("code")]
+        quotes_map = await self._get_tencent_quotes(codes) if needs_quotes else {}
+        industry_map = await self._get_baostock_industry_map() if needs_industry else {}
+        roe_map = await self._get_akshare_roe_map() if needs_roe else {}
+
+        rows = []
+        for doc in base_docs:
+            row = self._merge_external_row(doc, quotes_map, industry_map, roe_map)
+            if self._matches_conditions(row, conditions):
+                rows.append(row)
+
+        rows = self._sort_external_rows(rows, order_by)
+        total = len(rows)
+        return rows[offset:offset + limit], total
+
+    async def _load_base_stock_docs(self, db: Any, source_candidates: List[str]) -> List[Dict[str, Any]]:
+        projection = {
+            "_id": 0, "code": 1, "symbol": 1, "name": 1, "industry": 1,
+            "area": 1, "market": 1, "list_date": 1, "source": 1,
+        }
+        for candidate in source_candidates or ["akshare", "tushare", "baostock"]:
+            docs = await db["stock_basic_info"].find({"source": candidate}, projection).to_list(length=None)
+            if docs:
+                return docs
+        return await db["stock_basic_info"].find({}, projection).to_list(length=None)
+
+    def _merge_external_row(
+        self,
+        doc: Dict[str, Any],
+        quotes_map: Dict[str, Dict[str, Any]],
+        industry_map: Dict[str, str],
+        roe_map: Dict[str, float],
+    ) -> Dict[str, Any]:
+        code = str(doc.get("code") or doc.get("symbol") or "").zfill(6)
+        row = self._format_result(doc)
+        row["code"] = code
+        row["symbol"] = code
+        if not row.get("name"):
+            row["name"] = doc.get("name") or code
+
+        industry = doc.get("industry") or industry_map.get(code)
+        if industry:
+            row["industry"] = industry
+
+        quote = quotes_map.get(code)
+        if quote:
+            row.update({k: v for k, v in quote.items() if v is not None})
+
+        if code in roe_map:
+            row["roe"] = roe_map[code]
+
+        row["source"] = row.get("source") or "external_fallback"
+        return row
+
+    async def _get_tencent_quotes(self, codes: List[str]) -> Dict[str, Dict[str, Any]]:
+        cached = self._quotes_cache.get("data")
+        if cached is not None and time.time() - self._quotes_cache.get("ts", 0) < self._quotes_cache_ttl:
+            return cached
+
+        data = await asyncio.to_thread(self._fetch_tencent_quotes, codes)
+        self._quotes_cache = {"ts": time.time(), "data": data}
+        return data
+
+    def _fetch_tencent_quotes(self, codes: List[str]) -> Dict[str, Dict[str, Any]]:
+        def prefixed(code: str) -> str:
+            code6 = str(code).zfill(6)
+            if code6.startswith(("6", "9")):
+                return f"sh{code6}"
+            if code6.startswith(("8", "4")):
+                return f"bj{code6}"
+            return f"sz{code6}"
+
+        result: Dict[str, Dict[str, Any]] = {}
+        for i in range(0, len(codes), 800):
+            batch = [c for c in codes[i:i + 800] if c]
+            if not batch:
+                continue
+            url = "https://qt.gtimg.cn/q=" + ",".join(prefixed(c) for c in batch)
+            try:
+                req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+                raw = urllib.request.urlopen(req, timeout=15).read().decode("gbk", "ignore")
+            except Exception as e:
+                logger.warning(f"腾讯行情批次拉取失败: {e}")
+                continue
+
+            for line in raw.strip().split(";"):
+                if not line.strip() or '="' not in line:
+                    continue
+                try:
+                    key = line.split("=")[0].split("_")[-1]
+                    vals = line.split('"')[1].split("~")
+                    if len(vals) < 53:
+                        continue
+                    code = key[2:].zfill(6)
+                    pe_ttm = self._safe_float(vals[39])
+                    pb = self._safe_float(vals[46])
+                    pe_static = self._safe_float(vals[52])
+                    result[code] = {
+                        "name": vals[1] or None,
+                        "close": self._safe_float(vals[3]),
+                        "pct_chg": self._safe_float(vals[32]),
+                        "high": self._safe_float(vals[33]),
+                        "low": self._safe_float(vals[34]),
+                        "volume": self._safe_float(vals[36]),
+                        "amount": self._safe_float(vals[37]),  # 万元
+                        "turnover_rate": self._safe_float(vals[38]),
+                        "pe": pe_static if pe_static is not None else pe_ttm,
+                        "pe_ttm": pe_ttm,
+                        "total_mv": self._safe_float(vals[44]),  # 亿元
+                        "circ_mv": self._safe_float(vals[45]),   # 亿元
+                        "pb": pb,
+                        "pb_mrq": pb,
+                        "volume_ratio": self._safe_float(vals[49]),
+                    }
+                except Exception:
+                    continue
+        logger.info(f"✅ 腾讯行情兜底获取 {len(result)} 条")
+        return result
+
+    async def _get_baostock_industry_map(self) -> Dict[str, str]:
+        cached = self._industry_cache.get("data")
+        if cached is not None and time.time() - self._industry_cache.get("ts", 0) < self._industry_cache_ttl:
+            return cached
+
+        data = await asyncio.to_thread(self._fetch_baostock_industry_map)
+        if len(data) < self._industry_min_usable_count:
+            logger.warning(f"BaoStock 行业数据不完整（{len(data)} 条），改用 AKShare 行业兜底")
+            akshare_data = await asyncio.to_thread(self._fetch_akshare_industry_map)
+            if len(akshare_data) > len(data):
+                data = akshare_data
+
+        # 不缓存空或明显不完整的行业表，避免一次临时失败导致页面下拉长期异常。
+        if len(data) >= self._industry_min_usable_count:
+            self._industry_cache = {"ts": time.time(), "data": data}
+        return data
+
+    def _fetch_baostock_industry_map(self) -> Dict[str, str]:
+        try:
+            import baostock as bs
+        except ImportError:
+            logger.warning("BaoStock 未安装，无法获取行业兜底数据")
+            return {}
+
+        industry_map: Dict[str, str] = {}
+        lg = bs.login()
+        if getattr(lg, "error_code", "") != "0":
+            logger.warning(f"BaoStock 登录失败，无法获取行业: {getattr(lg, 'error_msg', '')}")
+            return {}
+        try:
+            rs = bs.query_stock_industry()
+            while rs.error_code == "0" and rs.next():
+                row = rs.get_row_data()
+                code = str(row[1] if len(row) > 1 else "").replace("sh.", "").replace("sz.", "").zfill(6)
+                raw_industry = row[3] if len(row) > 3 else ""
+                industry = re.sub(r"^[A-Z]\d+", "", str(raw_industry)).strip() if raw_industry else ""
+                if code and industry:
+                    industry_map[code] = industry
+        finally:
+            bs.logout()
+
+        logger.info(f"✅ BaoStock 行业兜底获取 {len(industry_map)} 条")
+        return industry_map
+
+    def _fetch_akshare_industry_map(self) -> Dict[str, str]:
+        try:
+            import akshare as ak
+        except ImportError:
+            logger.warning("AKShare 未安装，无法获取行业兜底数据")
+            return {}
+
+        for report_date in self._financial_report_date_candidates():
+            try:
+                with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                    df = ak.stock_yjbb_em(date=report_date)
+                if df is None or getattr(df, "empty", True):
+                    continue
+
+                code_col = "股票代码" if "股票代码" in df.columns else None
+                industry_col = "所处行业" if "所处行业" in df.columns else None
+                if not code_col or not industry_col:
+                    continue
+
+                industry_map: Dict[str, str] = {}
+                for _, row in df.iterrows():
+                    code = str(row.get(code_col) or "").zfill(6)
+                    industry = self._safe_text(row.get(industry_col))
+                    if code and industry:
+                        industry_map[code] = industry
+                if industry_map:
+                    logger.info(f"✅ AKShare 行业兜底获取 {len(industry_map)} 条，报告期={report_date}")
+                    return industry_map
+            except Exception as e:
+                logger.warning(f"AKShare 行业报告期 {report_date} 获取失败: {e}")
+        return {}
+
+    async def _get_akshare_roe_map(self) -> Dict[str, float]:
+        cached = self._roe_cache.get("data")
+        if cached is not None and time.time() - self._roe_cache.get("ts", 0) < self._roe_cache_ttl:
+            return cached
+
+        data = await asyncio.to_thread(self._fetch_akshare_roe_map)
+        self._roe_cache = {"ts": time.time(), "data": data}
+        return data
+
+    def _fetch_akshare_roe_map(self) -> Dict[str, float]:
+        try:
+            import akshare as ak
+        except ImportError:
+            logger.warning("AKShare 未安装，无法获取 ROE 兜底数据")
+            return {}
+
+        date_candidates = self._financial_report_date_candidates()
+        for report_date in date_candidates:
+            try:
+                with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                    df = ak.stock_yjbb_em(date=report_date)
+                if df is None or getattr(df, "empty", True):
+                    continue
+                code_col = "股票代码" if "股票代码" in df.columns else None
+                roe_col = "净资产收益率" if "净资产收益率" in df.columns else None
+                if not code_col or not roe_col:
+                    continue
+                roe_map: Dict[str, float] = {}
+                for _, row in df.iterrows():
+                    code = str(row.get(code_col) or "").zfill(6)
+                    roe = self._safe_float(row.get(roe_col))
+                    if code and roe is not None:
+                        roe_map[code] = roe
+                if roe_map:
+                    logger.info(f"✅ AKShare ROE 兜底获取 {len(roe_map)} 条，报告期={report_date}")
+                    return roe_map
+            except Exception as e:
+                logger.warning(f"AKShare ROE 报告期 {report_date} 获取失败: {e}")
+        return {}
+
+    def _financial_report_date_candidates(self) -> List[str]:
+        now = datetime.now()
+        quarters = ["0331", "0630", "0930", "1231"]
+        candidates = []
+        for year in [now.year, now.year - 1]:
+            for q in reversed(quarters):
+                date = f"{year}{q}"
+                if date <= now.strftime("%Y%m%d"):
+                    candidates.append(date)
+        # 财报披露可能滞后，保留最近 6 个报告期依次尝试。
+        return candidates[:6]
+
+    def _matches_conditions(self, row: Dict[str, Any], conditions: List[Dict[str, Any]]) -> bool:
+        for condition in conditions:
+            field = self.basic_fields.get(self._condition_field(condition), self._condition_field(condition))
+            operator = self._condition_operator(condition)
+            expected = self._condition_value(condition)
+            actual = row.get(field)
+            if not self._match_condition(actual, operator, expected):
+                return False
+        return True
+
+    def _match_condition(self, actual: Any, operator: Optional[str], expected: Any) -> bool:
+        if actual is None:
+            return False
+        if isinstance(actual, float) and math.isnan(actual):
+            return False
+
+        if operator == "between" and isinstance(expected, list) and len(expected) == 2:
+            actual_num = self._safe_float(actual)
+            low = self._safe_float(expected[0])
+            high = self._safe_float(expected[1])
+            return actual_num is not None and low is not None and high is not None and low <= actual_num <= high
+        if operator in {">", "<", ">=", "<="}:
+            actual_num = self._safe_float(actual)
+            expected_num = self._safe_float(expected)
+            if actual_num is None or expected_num is None:
+                return False
+            if operator == ">":
+                return actual_num > expected_num
+            if operator == "<":
+                return actual_num < expected_num
+            if operator == ">=":
+                return actual_num >= expected_num
+            return actual_num <= expected_num
+        if operator == "==":
+            return str(actual) == str(expected)
+        if operator == "!=":
+            return str(actual) != str(expected)
+        if operator == "in":
+            values = expected if isinstance(expected, list) else [expected]
+            return str(actual) in {str(v) for v in values}
+        if operator == "not_in":
+            values = expected if isinstance(expected, list) else [expected]
+            return str(actual) not in {str(v) for v in values}
+        if operator == "contains":
+            return str(expected).lower() in str(actual).lower()
+        return False
+
+    def _sort_external_rows(
+        self,
+        rows: List[Dict[str, Any]],
+        order_by: Optional[List[Dict[str, str]]]
+    ) -> List[Dict[str, Any]]:
+        sort_items = order_by or [{"field": "total_mv", "direction": "desc"}]
+        for order in reversed(sort_items):
+            field = self.basic_fields.get(order.get("field"), order.get("field"))
+            reverse = order.get("direction", "desc").lower() == "desc"
+            direction = -1 if reverse else 1
+            rows.sort(
+                key=lambda item: (
+                    item.get(field) is None,
+                    direction * (self._safe_float(item.get(field)) if self._safe_float(item.get(field)) is not None else 0),
+                )
+            )
+        return rows
+
+    def _safe_float(self, value: Any) -> Optional[float]:
+        try:
+            if value is None or value == "" or value == "--":
+                return None
+            number = float(value)
+            if math.isnan(number) or math.isinf(number):
+                return None
+            return number
+        except (TypeError, ValueError):
+            return None
+
+    def _safe_text(self, value: Any) -> str:
+        if value is None:
+            return ""
+        if isinstance(value, float) and math.isnan(value):
+            return ""
+        text = str(value).strip()
+        if not text or text.lower() in {"nan", "none", "--"}:
+            return ""
+        return text
+
+    async def get_external_industries(self) -> List[Dict[str, Any]]:
+        industry_map = await self._get_baostock_industry_map()
+        if not industry_map:
+            return []
+        counts: Dict[str, int] = {}
+        for industry in industry_map.values():
+            counts[industry] = counts.get(industry, 0) + 1
+        return [
+            {"value": name, "label": name, "count": count}
+            for name, count in sorted(counts.items(), key=lambda item: item[1], reverse=True)
+        ]
     
     async def _build_query(self, conditions: List[Dict[str, Any]]) -> Dict[str, Any]:
         """构建MongoDB查询条件"""

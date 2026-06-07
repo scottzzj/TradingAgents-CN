@@ -1102,12 +1102,47 @@ async def get_task_details(
     user: dict = Depends(get_current_user),
     svc: QueueService = Depends(get_queue_service)
 ):
-    """获取任务详情（使用不同的路径避免冲突）"""
+    """Get task details from Redis first, then MongoDB history."""
     t = await svc.get_task(task_id)
+    if t and t.get("user") == user["id"]:
+        return t
+
+    if not t:
+        # Completed web analysis tasks are persisted in MongoDB after leaving Redis.
+        from app.core.database import get_mongo_db
+        db = get_mongo_db()
+
+        task_doc = await db.analysis_tasks.find_one({"task_id": task_id}, {"_id": 0})
+        if task_doc:
+            task_user = str(task_doc.get("user_id") or task_doc.get("user") or "")
+            if not task_user or task_user == user["id"]:
+                task_doc["source"] = "analysis_tasks"
+                return task_doc
+
+        report_doc = await db.analysis_reports.find_one({"task_id": task_id}, {"_id": 0})
+        if report_doc:
+            report_user = str(report_doc.get("user_id") or report_doc.get("user") or "")
+            if not report_user or report_user == user["id"]:
+                return {
+                    "task_id": task_id,
+                    "user": user["id"],
+                    "status": report_doc.get("status", "completed"),
+                    "progress": 100,
+                    "symbol": report_doc.get("stock_symbol"),
+                    "stock_code": report_doc.get("stock_symbol"),
+                    "stock_name": report_doc.get("stock_name"),
+                    "analysis_id": report_doc.get("analysis_id"),
+                    "created_at": report_doc.get("created_at"),
+                    "completed_at": report_doc.get("updated_at") or report_doc.get("created_at"),
+                    "analysts": report_doc.get("analysts", []),
+                    "research_depth": report_doc.get("research_depth"),
+                    "summary": report_doc.get("summary", ""),
+                    "source": "analysis_reports",
+                }
+
     if not t or t.get("user") != user["id"]:
         raise HTTPException(status_code=404, detail="任务不存在")
     return t
-
 
 # ==================== 僵尸任务管理 ====================
 

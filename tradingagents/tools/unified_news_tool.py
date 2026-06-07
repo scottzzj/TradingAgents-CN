@@ -8,8 +8,14 @@
 import logging
 from datetime import datetime
 import re
+import os
 
 logger = logging.getLogger(__name__)
+
+
+def _get_configured_database_name() -> str:
+    """读取 app 同步数据所在的 MongoDB 库名，避免分析链路落到旧库。"""
+    return os.getenv("MONGODB_DATABASE_NAME") or os.getenv("MONGODB_DATABASE") or "tradingagents"
 
 class UnifiedNewsAnalyzer:
     """统一新闻分析器，整合所有新闻获取逻辑"""
@@ -113,7 +119,7 @@ class UnifiedNewsAnalyzer:
                 logger.warning(f"[统一新闻工具] 无法连接到MongoDB")
                 return ""
 
-            db = client.get_database('tradingagents')
+            db = client.get_database(_get_configured_database_name())
             collection = db.stock_news
 
             # 标准化股票代码（去除后缀）

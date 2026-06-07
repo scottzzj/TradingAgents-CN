@@ -400,24 +400,28 @@ class ConfigService:
             )
 
             if config_data:
-                print(f"📊 从数据库获取配置，版本: {config_data.get('version', 0)}, LLM配置数量: {len(config_data.get('llm_configs', []))}")
+                logger.info(
+                    "从数据库获取配置，版本: %s, LLM配置数量: %s",
+                    config_data.get("version", 0),
+                    len(config_data.get("llm_configs", [])),
+                )
                 return SystemConfig(**config_data)
 
             # 如果没有配置，创建默认配置
-            print("⚠️ 数据库中没有配置，创建默认配置")
+            logger.warning("数据库中没有配置，创建默认配置")
             return await self._create_default_config()
 
         except Exception as e:
-            print(f"❌ 从数据库获取配置失败: {e}")
+            logger.error("从数据库获取配置失败: %s", e)
 
             # 作为最后的回退，尝试从统一配置管理器获取
             try:
                 unified_system_config = await unified_config.get_unified_system_config()
                 if unified_system_config:
-                    print("🔄 回退到统一配置管理器")
+                    logger.info("回退到统一配置管理器")
                     return unified_system_config
             except Exception as e2:
-                print(f"从统一配置获取也失败: {e2}")
+                logger.error("从统一配置获取也失败: %s", e2)
 
             return None
     

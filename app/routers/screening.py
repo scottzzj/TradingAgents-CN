@@ -302,69 +302,82 @@ async def get_industries(user: dict = Depends(get_current_user)):
 
         logger.info(f"[get_industries] 数据源优先级: {enabled_sources}")
 
-        # 🔥 按优先级查询：优先使用优先级最高的数据源
-        preferred_source = enabled_sources[0] if enabled_sources else 'tushare'
-
-        # 聚合查询：按行业分组并统计股票数量（只查询指定数据源）
-        pipeline = [
-            {
-                "$match": {
-                    "source": preferred_source,  # 🔥 只查询优先级最高的数据源
-                    "industry": {"$ne": None, "$ne": ""}  # 过滤空行业
-                }
-            },
-            {
-                "$group": {
-                    "_id": "$industry",
-                    "count": {"$sum": 1}
-                }
-            },
-            {"$sort": {"count": -1}},  # 按股票数量降序排序
-            {
-                "$project": {
-                    "industry": "$_id",
-                    "count": 1,
-                    "_id": 0
-                }
-            }
-        ]
-
+        preferred_source = None
         industries = []
-        async for doc in collection.aggregate(pipeline):
-            # 清洗字段，避免 NaN/Inf 导致 JSON 序列化失败
-            raw_industry = doc.get("industry")
-            safe_industry = ""
-            try:
-                if raw_industry is None:
-                    safe_industry = ""
-                elif isinstance(raw_industry, float):
-                    if raw_industry != raw_industry or raw_industry in (float("inf"), float("-inf")):
+
+        # 按优先级逐个查询；高优先级源可能启用但尚未入库，不能因此让下拉为空。
+        for source_name in enabled_sources:
+            pipeline = [
+                {
+                    "$match": {
+                        "source": source_name,
+                        "industry": {"$nin": [None, "", "未知", "--"]}
+                    }
+                },
+                {
+                    "$group": {
+                        "_id": "$industry",
+                        "count": {"$sum": 1}
+                    }
+                },
+                {"$sort": {"count": -1}},
+                {
+                    "$project": {
+                        "industry": "$_id",
+                        "count": 1,
+                        "_id": 0
+                    }
+                }
+            ]
+
+            current_industries = []
+            async for doc in collection.aggregate(pipeline):
+                # 清洗字段，避免 NaN/Inf 导致 JSON 序列化失败
+                raw_industry = doc.get("industry")
+                safe_industry = ""
+                try:
+                    if raw_industry is None:
                         safe_industry = ""
+                    elif isinstance(raw_industry, float):
+                        if raw_industry != raw_industry or raw_industry in (float("inf"), float("-inf")):
+                            safe_industry = ""
+                        else:
+                            safe_industry = str(raw_industry)
                     else:
                         safe_industry = str(raw_industry)
-                else:
-                    safe_industry = str(raw_industry)
-            except Exception:
-                safe_industry = ""
+                except Exception:
+                    safe_industry = ""
 
-            raw_count = doc.get("count", 0)
-            safe_count = 0
-            try:
-                if isinstance(raw_count, float):
-                    if raw_count != raw_count or raw_count in (float("inf"), float("-inf")):
-                        safe_count = 0
+                raw_count = doc.get("count", 0)
+                safe_count = 0
+                try:
+                    if isinstance(raw_count, float):
+                        if raw_count != raw_count or raw_count in (float("inf"), float("-inf")):
+                            safe_count = 0
+                        else:
+                            safe_count = int(raw_count)
                     else:
                         safe_count = int(raw_count)
-                else:
-                    safe_count = int(raw_count)
-            except Exception:
-                safe_count = 0
+                except Exception:
+                    safe_count = 0
 
-            industries.append({
-                "value": safe_industry,
-                "label": safe_industry,
-                "count": safe_count,
-            })
+                if safe_industry:
+                    current_industries.append({
+                        "value": safe_industry,
+                        "label": safe_industry,
+                        "count": safe_count,
+                    })
+
+            if current_industries:
+                industries = current_industries
+                preferred_source = source_name
+                break
+
+        if not industries:
+            fallback_industries = await enhanced_svc.db_service.get_external_industries()
+            if fallback_industries:
+                industries = fallback_industries
+                preferred_source = "baostock"
 
         logger.info(f"[get_industries] 从数据源 {preferred_source} 返回 {len(industries)} 个行业")
 

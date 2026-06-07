@@ -66,15 +66,48 @@ class MultiSourceBasicsSyncService:
     async def get_status(self) -> Dict[str, Any]:
         """获取同步状态"""
         if self._last_status:
-            return self._last_status
+            db = get_mongo_db()
+            return await self._recover_stale_running_status(db, self._last_status.copy())
 
         db = get_mongo_db()
         doc = await db[STATUS_COLLECTION].find_one({"job": JOB_KEY})
         if doc:
             # 移除MongoDB的_id字段以避免序列化问题
             doc.pop("_id", None)
-            return doc
+            return await self._recover_stale_running_status(db, doc)
         return {"job": JOB_KEY, "status": "never_run"}
+
+    async def _recover_stale_running_status(
+        self,
+        db: AsyncIOMotorDatabase,
+        status: Dict[str, Any],
+        stale_after: timedelta = timedelta(minutes=30),
+    ) -> Dict[str, Any]:
+        """将进程已退出但仍显示 running 的同步记录标记为失败，避免 UI 被旧状态卡住。"""
+        if self._running or status.get("status") != "running":
+            return status
+
+        started_at_raw = status.get("started_at")
+        if not started_at_raw:
+            return status
+
+        try:
+            started_at = datetime.fromisoformat(str(started_at_raw))
+        except ValueError:
+            return status
+
+        if datetime.now() - started_at <= stale_after:
+            return status
+
+        recovered = {
+            **status,
+            "status": "failed",
+            "finished_at": datetime.now().isoformat(),
+            "message": "同步任务已失联，请重新运行",
+        }
+        await self._persist_status(db, recovered)
+        logger.warning("Recovered stale multi-source stock basics sync status: started_at=%s", started_at_raw)
+        return recovered
 
     async def _persist_status(self, db: AsyncIOMotorDatabase, stats: Dict[str, Any]) -> None:
         """持久化同步状态"""
@@ -261,13 +294,12 @@ class MultiSourceBasicsSyncService:
                         continue
                     data_source = source_used
 
-                    # 构建文档
+                    # 构建文档。部分数据源（例如 AKShare 股票列表）不带行业/地区，
+                    # 空文本不能覆盖已经由其他接口补齐的有效分类。
                     doc = {
                         "code": code,
                         "symbol": code,  # 添加 symbol 字段（标准化字段）
                         "name": name,
-                        "area": area,
-                        "industry": industry,
                         "market": market,
                         "list_date": list_date,
                         "sse": sse,
@@ -276,6 +308,10 @@ class MultiSourceBasicsSyncService:
                         "source": data_source,  # 🔥 使用实际数据源
                         "updated_at": datetime.now(),
                     }
+                    if self._has_text_value(area):
+                        doc["area"] = area
+                    if self._has_text_value(industry):
+                        doc["industry"] = industry
 
                     # 添加财务指标
                     self._add_financial_metrics(doc, daily_metrics)
@@ -336,6 +372,14 @@ class MultiSourceBasicsSyncService:
     def _add_financial_metrics(self, doc: Dict, daily_metrics: Dict) -> None:
         """委托到 basics_sync.processing.add_financial_metrics"""
         return _add_financial_metrics_util(doc, daily_metrics)
+
+    @staticmethod
+    def _has_text_value(value: Any) -> bool:
+        """判断文本字段是否值得写入数据库。"""
+        if value is None:
+            return False
+        text = str(value).strip()
+        return bool(text) and text.lower() not in {"nan", "none", "--", "未知"}
 
     def _generate_full_symbol(self, code: str) -> str:
         """

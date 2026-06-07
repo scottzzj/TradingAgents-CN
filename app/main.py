@@ -292,11 +292,12 @@ async def lifespan(app: FastAPI):
             preferred_sources = ["akshare", "baostock"]
             logger.info(f"📊 股票基础信息同步优先数据源: AKShare > BaoStock (Tushare已禁用)")
 
-        # 立即在启动后尝试一次（不阻塞）
-        async def run_sync_with_sources():
-            await multi_source_service.run_full_sync(force=False, preferred_sources=preferred_sources)
+        # 启用基础信息同步时才在启动后尝试一次，避免显式关闭同步后仍触发全量补数。
+        if settings.SYNC_STOCK_BASICS_ENABLED:
+            async def run_sync_with_sources():
+                await multi_source_service.run_full_sync(force=False, preferred_sources=preferred_sources)
 
-        asyncio.create_task(run_sync_with_sources())
+            asyncio.create_task(run_sync_with_sources())
 
         # 配置调度：优先使用 CRON，其次使用 HH:MM
         if settings.SYNC_STOCK_BASICS_ENABLED:
@@ -719,9 +720,9 @@ app.include_router(sse.router, prefix="/api/stream", tags=["streaming"])
 app.include_router(sync_router.router)
 app.include_router(multi_source_sync.router)
 app.include_router(paper_router.router, prefix="/api", tags=["paper"])
-app.include_router(tushare_init.router, prefix="/api", tags=["tushare-init"])
-app.include_router(akshare_init.router, prefix="/api", tags=["akshare-init"])
-app.include_router(baostock_init.router, prefix="/api", tags=["baostock-init"])
+app.include_router(tushare_init.router, tags=["tushare-init"])
+app.include_router(akshare_init.router, tags=["akshare-init"])
+app.include_router(baostock_init.router, tags=["baostock-init"])
 app.include_router(historical_data.router, tags=["historical-data"])
 app.include_router(multi_period_sync.router, tags=["multi-period-sync"])
 app.include_router(financial_data.router, tags=["financial-data"])

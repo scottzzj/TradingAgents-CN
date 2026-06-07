@@ -6,6 +6,7 @@
 import asyncio
 import uuid
 import logging
+import re
 from datetime import datetime
 from typing import Dict, Any, Optional, List
 from pathlib import Path
@@ -108,6 +109,9 @@ def get_provider_and_url_by_model_sync(model_name: str) -> dict:
         dict: {"provider": "google", "backend_url": "https://...", "api_key": "xxx"}
     """
     try:
+        requested_model_name = str(model_name or "")
+        requested_model_name_lower = requested_model_name.lower()
+
         # 使用同步 MongoDB 客户端直接查询
         from pymongo import MongoClient
         from app.core.config import settings
@@ -124,7 +128,8 @@ def get_provider_and_url_by_model_sync(model_name: str) -> dict:
             llm_configs = doc["llm_configs"]
 
             for config_dict in llm_configs:
-                if config_dict.get("model_name") == model_name:
+                configured_model_name = str(config_dict.get("model_name") or "")
+                if configured_model_name.lower() == requested_model_name_lower:
                     provider = config_dict.get("provider")
                     api_base = config_dict.get("api_base")
                     model_api_key = config_dict.get("api_key")  # 🔥 获取模型配置的 API Key
@@ -152,6 +157,10 @@ def get_provider_and_url_by_model_sync(model_name: str) -> dict:
                         else:
                             logger.warning(f"⚠️ [同步查询] 未找到 {provider} 的 API Key")
 
+                    from tradingagents.llm_clients.provider_keys import normalize_provider_key, default_backend_url
+
+                    provider_key = normalize_provider_key(provider)
+
                     # 确定 backend_url
                     backend_url = None
                     if api_base:
@@ -160,15 +169,18 @@ def get_provider_and_url_by_model_sync(model_name: str) -> dict:
                     elif provider_doc and provider_doc.get("default_base_url"):
                         backend_url = provider_doc["default_base_url"]
                         logger.info(f"✅ [同步查询] 模型 {model_name} 使用厂家默认 API: {backend_url}")
+                    elif provider_key in {"openai", "custom_openai"}:
+                        raise ValueError(
+                            f"模型 {model_name} 的厂家 {provider} 未配置 default_base_url，"
+                            "OpenAI兼容模型必须使用配置中的 DefaultBaseURL"
+                        )
                     else:
                         backend_url = _get_default_backend_url(provider)
-                        logger.warning(f"⚠️ [同步查询] 厂家 {provider} 没有配置 default_base_url，使用硬编码默认值")
+                        logger.warning(f"⚠️ [同步查询] 厂家 {provider} 没有配置 default_base_url，使用内置默认值")
 
-                    from tradingagents.llm_clients.provider_keys import normalize_provider_key, default_backend_url
-
-                    provider_key = normalize_provider_key(provider)
                     if provider_key == "qwen" and backend_url == "https://dashscope.aliyuncs.com/api/v1":
                         backend_url = default_backend_url(provider_key)
+                    backend_url = _normalize_openai_compatible_backend_url(provider_key, backend_url)
 
                     client.close()
                     return {
@@ -176,6 +188,61 @@ def get_provider_and_url_by_model_sync(model_name: str) -> dict:
                         "backend_url": backend_url,
                         "api_key": api_key
                     }
+
+        # 模型目录是配置管理页面保存自定义模型的主要入口。
+        # system_configs.llm_configs 查不到时，继续按 model_catalog 反查所属厂家。
+        catalog_doc = db.model_catalog.find_one({
+            "$or": [
+                {"models.name": {"$regex": f"^{re.escape(requested_model_name)}$", "$options": "i"}},
+                {"models.model_name": {"$regex": f"^{re.escape(requested_model_name)}$", "$options": "i"}},
+                {"models.id": {"$regex": f"^{re.escape(requested_model_name)}$", "$options": "i"}},
+                {"models.model_id": {"$regex": f"^{re.escape(requested_model_name)}$", "$options": "i"}},
+                {"models": {"$regex": f"^{re.escape(requested_model_name)}$", "$options": "i"}},
+            ]
+        })
+        if catalog_doc:
+            provider = catalog_doc.get("provider")
+            providers_collection = db.llm_providers
+            provider_doc = providers_collection.find_one({"name": provider})
+
+            backend_url = None
+            api_key = None
+
+            if provider_doc:
+                if provider_doc.get("default_base_url"):
+                    backend_url = provider_doc["default_base_url"]
+                    logger.info(f"✅ [同步查询] 模型目录 {model_name} 使用厂家 {provider} 的默认 API: {backend_url}")
+
+                provider_api_key = provider_doc.get("api_key")
+                if provider_api_key and provider_api_key.strip() and provider_api_key != "your-api-key":
+                    api_key = provider_api_key
+                    logger.info(f"✅ [同步查询] 模型目录 {model_name} 使用厂家 {provider} 的 API Key")
+
+            if not api_key:
+                api_key = _get_env_api_key_for_provider(provider)
+                if api_key:
+                    logger.info(f"✅ [同步查询] 模型目录 {model_name} 使用环境变量的 API Key")
+                else:
+                    logger.warning(f"⚠️ [同步查询] 模型目录未找到 {provider} 的 API Key")
+
+            from tradingagents.llm_clients.provider_keys import normalize_provider_key
+
+            provider_key = normalize_provider_key(provider)
+            if not backend_url:
+                if provider_key in {"openai", "custom_openai"}:
+                    raise ValueError(
+                        f"模型 {model_name} 的厂家 {provider} 未配置 default_base_url，"
+                        "OpenAI兼容模型必须使用配置中的 DefaultBaseURL"
+                    )
+                backend_url = _get_default_backend_url(provider_key)
+            backend_url = _normalize_openai_compatible_backend_url(provider_key, backend_url)
+
+            client.close()
+            return {
+                "provider": provider_key,
+                "backend_url": backend_url,
+                "api_key": api_key
+            }
 
         client.close()
 
@@ -190,7 +257,10 @@ def get_provider_and_url_by_model_sync(model_name: str) -> dict:
             providers_collection = db.llm_providers
             provider_doc = providers_collection.find_one({"name": provider})
 
-            backend_url = _get_default_backend_url(provider)
+            from tradingagents.llm_clients.provider_keys import normalize_provider_key, default_backend_url
+
+            provider_key = normalize_provider_key(provider)
+            backend_url = None
             api_key = None
 
             if provider_doc:
@@ -210,11 +280,17 @@ def get_provider_and_url_by_model_sync(model_name: str) -> dict:
                 if api_key:
                     logger.info(f"✅ [同步查询] 使用环境变量的 API Key")
 
-            from tradingagents.llm_clients.provider_keys import normalize_provider_key, default_backend_url
+            if not backend_url:
+                if provider_key in {"openai", "custom_openai"}:
+                    raise ValueError(
+                        f"厂家 {provider} 未配置 default_base_url，"
+                        "OpenAI兼容模型必须使用配置中的 DefaultBaseURL"
+                    )
+                backend_url = _get_default_backend_url(provider_key)
 
-            provider_key = normalize_provider_key(provider)
             if provider_key == "qwen" and backend_url == "https://dashscope.aliyuncs.com/api/v1":
                 backend_url = default_backend_url(provider_key)
+            backend_url = _normalize_openai_compatible_backend_url(provider_key, backend_url)
 
             client.close()
             return {
@@ -231,7 +307,9 @@ def get_provider_and_url_by_model_sync(model_name: str) -> dict:
         provider_key = normalize_provider_key(provider)
         return {
             "provider": provider_key,
-            "backend_url": _get_default_backend_url(provider_key),
+            "backend_url": _normalize_openai_compatible_backend_url(
+                provider_key, _get_default_backend_url(provider_key)
+            ),
             "api_key": _get_env_api_key_for_provider(provider_key)
         }
 
@@ -249,7 +327,10 @@ def get_provider_and_url_by_model_sync(model_name: str) -> dict:
             providers_collection = db.llm_providers
             provider_doc = providers_collection.find_one({"name": provider})
 
-            backend_url = _get_default_backend_url(provider)
+            from tradingagents.llm_clients.provider_keys import normalize_provider_key
+
+            provider_key = normalize_provider_key(provider)
+            backend_url = None
             api_key = None
 
             if provider_doc:
@@ -267,10 +348,18 @@ def get_provider_and_url_by_model_sync(model_name: str) -> dict:
             if not api_key:
                 api_key = _get_env_api_key_for_provider(provider)
 
+            if not backend_url:
+                if provider_key in {"openai", "custom_openai"}:
+                    raise ValueError(
+                        f"厂家 {provider} 未配置 default_base_url，"
+                        "OpenAI兼容模型必须使用配置中的 DefaultBaseURL"
+                    )
+                backend_url = _get_default_backend_url(provider_key)
+
             client.close()
             return {
-                "provider": provider,
-                "backend_url": backend_url,
+                "provider": provider_key,
+                "backend_url": _normalize_openai_compatible_backend_url(provider_key, backend_url),
                 "api_key": api_key
             }
         except Exception as e2:
@@ -279,7 +368,9 @@ def get_provider_and_url_by_model_sync(model_name: str) -> dict:
         # 最后回退到硬编码的默认 URL 和环境变量 API Key
         return {
             "provider": provider,
-            "backend_url": _get_default_backend_url(provider),
+            "backend_url": _normalize_openai_compatible_backend_url(
+                provider, _get_default_backend_url(provider)
+            ),
             "api_key": _get_env_api_key_for_provider(provider)
         }
 
@@ -312,6 +403,25 @@ def _get_env_api_key_for_provider(provider: str) -> str:
     return None
 
 
+def _normalize_openai_compatible_backend_url(provider: str, backend_url: str) -> str:
+    """配置页测试会为 OpenAI 兼容接口补 /v1，分析链路保持同样行为。"""
+    if not backend_url:
+        return backend_url
+
+    from tradingagents.llm_clients.provider_keys import normalize_provider_key
+
+    provider_key = normalize_provider_key(provider)
+    if provider_key not in {"openai", "custom_openai"}:
+        return backend_url
+
+    normalized_url = backend_url.rstrip("/")
+    if not re.search(r"/v\d+$", normalized_url):
+        normalized_url = f"{normalized_url}/v1"
+        logger.info(f"✅ [同步查询] OpenAI兼容地址补全 /v1: {normalized_url}")
+
+    return normalized_url
+
+
 def _get_default_backend_url(provider: str) -> str:
     """
     根据供应商名称返回默认的 backend_url
@@ -325,6 +435,10 @@ def _get_default_backend_url(provider: str) -> str:
     from tradingagents.llm_clients.provider_keys import default_backend_url, normalize_provider_key
 
     provider_key = normalize_provider_key(provider)
+    if provider_key in {"openai", "custom_openai"}:
+        raise ValueError(
+            f"厂家 {provider} 未配置 default_base_url，OpenAI兼容模型必须使用配置中的 DefaultBaseURL"
+        )
     if provider_key == "302ai":
         url = "https://api.302.ai/v1"
     elif provider_key == "aihubmix":
@@ -521,10 +635,7 @@ def create_analysis_config(
         logger.info(f"🔑 快速模型 API Key: {'已配置' if config['quick_api_key'] else '未配置（将使用环境变量）'}")
         logger.info(f"🔑 深度模型 API Key: {'已配置' if config['deep_api_key'] else '未配置（将使用环境变量）'}")
     except Exception as e:
-        logger.warning(f"⚠️  无法从数据库获取 backend_url 和 API Key: {e}")
-        config["backend_url"] = _get_default_backend_url(llm_provider)
-
-        logger.info(f"⚠️  使用回退的 backend_url: {config['backend_url']}")
+        raise ValueError(f"无法从配置获取大模型 API 地址，请检查厂家 DefaultBaseURL: {e}") from e
 
     # 添加分析师配置
     config["selected_analysts"] = selected_analysts

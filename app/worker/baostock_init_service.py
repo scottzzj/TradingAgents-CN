@@ -81,6 +81,10 @@ class BaoStockInitService:
     async def check_database_status(self) -> Dict[str, Any]:
         """检查数据库状态"""
         try:
+            if self.db is None:
+                from app.core.database import get_mongo_db
+                self.db = get_mongo_db()
+
             # 检查基础信息
             basic_info_count = await self.db.stock_basic_info.count_documents({"data_source": "baostock"})
             basic_info_latest = None

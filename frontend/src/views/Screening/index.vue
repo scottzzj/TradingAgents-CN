@@ -165,11 +165,11 @@
           </el-col>
 
           <el-col :span="8">
-            <el-form-item label="成交量">
-              <el-select v-model="filters.volumeLevel" placeholder="选择成交量水平">
-                <el-option label="活跃 (高成交量)" value="high" />
-                <el-option label="正常 (中等成交量)" value="medium" />
-                <el-option label="清淡 (低成交量)" value="low" />
+            <el-form-item label="成交额">
+              <el-select v-model="filters.volumeLevel" placeholder="选择成交额水平">
+                <el-option label="活跃 (高成交额)" value="high" />
+                <el-option label="正常 (中等成交额)" value="medium" />
+                <el-option label="清淡 (低成交额)" value="low" />
               </el-select>
             </el-form-item>
           </el-col>
@@ -218,7 +218,9 @@
     <el-card v-if="screeningResults.length > 0" class="results-panel" shadow="never">
       <template #header>
         <div class="card-header">
-          <span>筛选结果 ({{ screeningResults.length }}只股票)</span>
+          <span>
+            筛选结果 (命中 {{ screeningTotal }} 只，已加载 {{ screeningResults.length }} 只)
+          </span>
           <div class="header-actions">
             <el-button
               type="primary"
@@ -372,6 +374,7 @@ import { normalizeMarketForAnalysis, exchangeCodeToMarket, getMarketByStockCode 
 const screeningLoading = ref(false)
 const hasSearched = ref(false)
 const screeningResults = ref<StockInfo[]>([])
+const screeningTotal = ref(0)
 const selectedStocks = ref<StockInfo[]>([])
 const currentPage = ref(1)
 const pageSize = ref(20)
@@ -470,12 +473,12 @@ const performScreening = async () => {
       children.push({ field: 'pct_chg', op: 'between', value: [lo, hi] })
     }
 
-    // 成交量条件（映射为成交额范围，单位：元）
+    // 成交额条件（后端 amount 单位：万元）
     if (filters.volumeLevel) {
       const volumeRangeMap: Record<string, [number, number]> = {
-        high: [1000000000, Number.MAX_SAFE_INTEGER],    // 高成交量：>10亿元
-        medium: [300000000, 1000000000],                 // 中等成交量：3亿-10亿元
-        low: [0, 300000000]                              // 低成交量：<3亿元
+        high: [100000, Number.MAX_SAFE_INTEGER],    // 高成交额：>10亿元（后端 amount 单位为万元）
+        medium: [30000, 100000],                    // 中等成交额：3亿-10亿元
+        low: [0, 30000]                             // 低成交额：<3亿元
       }
       const volumeRange = volumeRangeMap[filters.volumeLevel]
       if (volumeRange) {
@@ -502,6 +505,7 @@ const performScreening = async () => {
     const res = await screeningApi.run(payload, { timeout: 120000 })
     const data = (res as any)?.data || res // ApiClient封装会返回 {success,data} 格式
     const items = data?.items || []
+    screeningTotal.value = Number(data?.total ?? items.length)
 
     // 直接使用后端返回的数据，字段名已统一
     screeningResults.value = items.map((it: any) => ({
@@ -543,7 +547,7 @@ const performScreening = async () => {
       macd_hist: it.macd_hist,
     }))
 
-    ElMessage.success(`筛选完成，找到 ${screeningResults.value.length} 只股票`)
+    ElMessage.success(`筛选完成，命中 ${screeningTotal.value} 只，已加载 ${screeningResults.value.length} 只`)
   } catch (error) {
     ElMessage.error('筛选失败，请重试')
   } finally {
@@ -565,6 +569,7 @@ const resetFilters = () => {
   })
 
   screeningResults.value = []
+  screeningTotal.value = 0
   selectedStocks.value = []
   hasSearched.value = false
   currentPage.value = 1
@@ -681,7 +686,10 @@ const getChangeClass = (changePercent: number) => {
   return ''
 }
 
-const formatMarketCap = (marketCap: number) => {
+const formatMarketCap = (marketCap?: number | null) => {
+  if (marketCap === null || marketCap === undefined || Number.isNaN(marketCap)) {
+    return '-'
+  }
   if (marketCap >= 10000) {
     return `${(marketCap / 10000).toFixed(2)}万亿`
   } else {

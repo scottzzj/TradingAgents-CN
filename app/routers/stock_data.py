@@ -3,6 +3,7 @@
 提供标准化的股票数据访问接口
 """
 from typing import Optional, List
+import re
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi import status
 
@@ -76,6 +77,25 @@ async def get_market_quotes(
         quotes = await service.get_market_quotes(symbol)
 
         if not quotes:
+            basic_info = await service.get_stock_basic_info(symbol)
+            if basic_info:
+                # Live quotes may be absent before quote sync; keep known stocks usable.
+                return MarketQuotesResponse(
+                    success=True,
+                    data=MarketQuotesExtended(
+                        symbol=basic_info.symbol,
+                        full_symbol=basic_info.full_symbol,
+                        market="CN",
+                        code=basic_info.code or basic_info.symbol,
+                        updated_at=basic_info.updated_at,
+                        data_source=basic_info.source or "stock_basic_info",
+                        data_version=basic_info.data_version,
+                        quote_available=False,
+                        name=basic_info.name,
+                        source=basic_info.source,
+                    ),
+                    message="行情数据尚未同步，已返回股票基础信息占位"
+                )
             return MarketQuotesResponse(
                 success=False,
                 message=f"未找到股票代码 {symbol} 的行情数据"
@@ -236,33 +256,42 @@ async def search_stocks(
         if not enabled_sources:
             enabled_sources = ['tushare', 'akshare', 'baostock']
 
-        preferred_source = enabled_sources[0] if enabled_sources else 'tushare'
+        result_source = None
 
         # 构建搜索条件
         search_conditions = []
+
+        escaped_keyword = re.escape(keyword)
 
         # 如果是6位数字，按代码精确匹配
         if keyword.isdigit() and len(keyword) == 6:
             search_conditions.append({"symbol": keyword})
         else:
             # 按名称模糊匹配
-            search_conditions.append({"name": {"$regex": keyword, "$options": "i"}})
+            search_conditions.append({"name": {"$regex": escaped_keyword, "$options": "i"}})
             # 如果包含数字，也尝试代码匹配
             if any(c.isdigit() for c in keyword):
-                search_conditions.append({"symbol": {"$regex": keyword}})
+                search_conditions.append({"symbol": {"$regex": escaped_keyword}})
 
         # 🔥 添加数据源筛选：只查询优先级最高的数据源
-        query = {
-            "$and": [
-                {"$or": search_conditions},
-                {"source": preferred_source}
-            ]
-        }
+        results = []
+        for source_name in enabled_sources:
+            query = {
+                "$and": [
+                    {"$or": search_conditions},
+                    {"source": source_name}
+                ]
+            }
+            cursor = collection.find(query, {"_id": 0}).limit(limit)
+            results = await cursor.to_list(length=limit)
+            if results:
+                result_source = source_name
+                break
 
-        # 执行搜索
-        cursor = collection.find(query, {"_id": 0}).limit(limit)
-
-        results = await cursor.to_list(length=limit)
+        if not results:
+            cursor = collection.find({"$or": search_conditions}, {"_id": 0}).limit(limit)
+            results = await cursor.to_list(length=limit)
+            result_source = "any"
 
         # 数据标准化
         service = get_stock_data_service()
@@ -276,7 +305,7 @@ async def search_stocks(
             "data": standardized_results,
             "total": len(standardized_results),
             "keyword": keyword,
-            "source": preferred_source,  # 🔥 返回数据来源
+            "source": result_source,
             "message": "搜索完成"
         }
         

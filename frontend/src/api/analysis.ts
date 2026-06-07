@@ -139,7 +139,7 @@ export const analysisApi = {
 
   // 获取分析结果
   getResult(analysisId: string): Promise<AnalysisResult> {
-    return request.get(`/api/analysis/${analysisId}/result`)
+    return request.get(`/api/analysis/tasks/${analysisId}/result`)
   },
 
   // 停止分析
@@ -476,7 +476,6 @@ export const getStockPlaceholder = (market: string): string => {
   }
   return placeholders[market] ?? '输入股票代码'
 }
-
 
 
 

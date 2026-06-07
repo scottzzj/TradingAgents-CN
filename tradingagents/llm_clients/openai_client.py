@@ -53,6 +53,9 @@ class OpenAIClient(BaseLLMClient):
         self.warn_if_unknown_model()
         llm_kwargs = {"model": self.model}
 
+        if self.provider in {"openai", "custom_openai"} and not self.base_url:
+            raise ValueError("OpenAI兼容模型必须配置 DefaultBaseURL，不能使用隐式默认地址")
+
         if self.provider in _PROVIDER_CONFIG:
             default_base_url, api_key_env = _PROVIDER_CONFIG[self.provider]
             llm_kwargs["base_url"] = self.base_url or default_base_url

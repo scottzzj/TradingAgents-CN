@@ -16,6 +16,7 @@
 """
 
 import logging
+import re
 from typing import Dict, List, Optional
 from motor.motor_asyncio import AsyncIOMotorDatabase
 
@@ -154,7 +155,30 @@ class UnifiedStockService:
         """
         collection_name = self.collection_map[market]["quotes"]
         collection = self.db[collection_name]
-        return await collection.find_one({"code": code}, {"_id": 0})
+        quote = await collection.find_one(
+            {"$or": [{"code": code}, {"symbol": code}]},
+            {"_id": 0}
+        )
+        if quote:
+            return quote
+
+        # 行情同步未写入 market_quotes 时，返回基础信息占位，避免已存在股票被显示为 404。
+        basic = await self.get_stock_info(market, code)
+        if not basic:
+            return None
+
+        return {
+            "code": basic.get("code") or code,
+            "symbol": basic.get("symbol") or basic.get("code") or code,
+            "name": basic.get("name"),
+            "market": market,
+            "source": basic.get("source"),
+            "close": basic.get("close") or basic.get("current_price") or basic.get("price"),
+            "pct_chg": basic.get("pct_chg") or basic.get("change_percent"),
+            "trade_date": basic.get("trade_date"),
+            "updated_at": basic.get("updated_at"),
+            "quote_available": False,
+        }
 
     async def search_stocks(
         self, 
@@ -177,11 +201,13 @@ class UnifiedStockService:
         collection = self.db[collection_name]
 
         # 支持代码和名称搜索
+        escaped_query = re.escape(query)
         filter_query = {
             "$or": [
-                {"code": {"$regex": query, "$options": "i"}},
-                {"name": {"$regex": query, "$options": "i"}},
-                {"name_en": {"$regex": query, "$options": "i"}}
+                {"code": {"$regex": escaped_query, "$options": "i"}},
+                {"symbol": {"$regex": escaped_query, "$options": "i"}},
+                {"name": {"$regex": escaped_query, "$options": "i"}},
+                {"name_en": {"$regex": escaped_query, "$options": "i"}}
             ]
         }
 
@@ -215,6 +241,8 @@ class UnifiedStockService:
         
         # 返回前 limit 条
         result_list = list(unique_results.values())[:limit]
+        for item in result_list:
+            item.pop("_id", None)
         logger.info(f"🔍 搜索 {market} 市场: '{query}' -> {len(result_list)} 条结果（已去重）")
         return result_list
 
@@ -283,4 +311,3 @@ class UnifiedStockService:
                 "timezone": "America/New_York"
             }
         ]
-

@@ -191,7 +191,7 @@ const connectTaskWebSocket = (taskId: string) => {
   try {
     const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
     const host = window.location.host
-    const wsUrl = `${wsProtocol}//${host}/api/ws/task/${taskId}`
+    const wsUrl = `${wsProtocol}//${host}/api/analysis/ws/task/${taskId}`
 
     const ws = new WebSocket(wsUrl)
 
@@ -534,4 +534,3 @@ const formatTime = (t:string) => t ? formatDateTime(t) : '-'
   .pagination-wrapper { display:flex; justify-content:center; margin-top: 16px; }
 }
 </style>
-

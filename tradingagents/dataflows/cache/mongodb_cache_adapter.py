@@ -35,7 +35,9 @@ class MongoDBCacheAdapter:
             from tradingagents.config.database_manager import get_mongodb_client
             self.mongodb_client = get_mongodb_client()
             if self.mongodb_client:
-                self.db = self.mongodb_client.get_database('tradingagents')
+                import os
+                database_name = os.getenv("MONGODB_DATABASE_NAME") or os.getenv("MONGODB_DATABASE") or "tradingagents"
+                self.db = self.mongodb_client.get_database(database_name)
                 logger.debug("✅ MongoDB连接初始化成功")
             else:
                 logger.warning("⚠️ MongoDB客户端不可用，回退到传统模式")

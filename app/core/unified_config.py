@@ -273,7 +273,7 @@ class UnifiedConfigManager:
             if config_data and config_data.get('data_source_configs'):
                 # 从数据库读取到配置
                 data_source_configs = config_data.get('data_source_configs', [])
-                print(f"✅ [unified_config] 从数据库读取到 {len(data_source_configs)} 个数据源配置")
+                print(f"[unified_config] loaded {len(data_source_configs)} data source configs from database")
 
                 # 转换为 DataSourceConfig 对象
                 result = []
@@ -281,16 +281,16 @@ class UnifiedConfigManager:
                     try:
                         result.append(DataSourceConfig(**ds_config))
                     except Exception as e:
-                        print(f"⚠️ [unified_config] 解析数据源配置失败: {e}, 配置: {ds_config}")
+                        print(f"[unified_config] failed to parse data source config: {e}, config: {ds_config}")
                         continue
 
                 # 按优先级排序（数字越大优先级越高）
                 result.sort(key=lambda x: x.priority, reverse=True)
                 return result
             else:
-                print("⚠️ [unified_config] 数据库中没有数据源配置，使用硬编码配置")
+                print("[unified_config] no data source config in database, using fallback config")
         except Exception as e:
-            print(f"⚠️ [unified_config] 从数据库读取数据源配置失败: {e}，使用硬编码配置")
+            print(f"[unified_config] failed to load data source config from database: {e}; using fallback config")
 
         # 🔥 回退到硬编码配置（兼容性）
         settings = self.get_system_settings()
@@ -341,7 +341,7 @@ class UnifiedConfigManager:
             if config_data and config_data.get('data_source_configs'):
                 # 从数据库读取到配置
                 data_source_configs = config_data.get('data_source_configs', [])
-                print(f"✅ [unified_config] 从数据库读取到 {len(data_source_configs)} 个数据源配置")
+                print(f"[unified_config] loaded {len(data_source_configs)} data source configs from database")
 
                 # 转换为 DataSourceConfig 对象
                 result = []
@@ -349,16 +349,16 @@ class UnifiedConfigManager:
                     try:
                         result.append(DataSourceConfig(**ds_config))
                     except Exception as e:
-                        print(f"⚠️ [unified_config] 解析数据源配置失败: {e}, 配置: {ds_config}")
+                        print(f"[unified_config] failed to parse data source config: {e}, config: {ds_config}")
                         continue
 
                 # 按优先级排序（数字越大优先级越高）
                 result.sort(key=lambda x: x.priority, reverse=True)
                 return result
             else:
-                print("⚠️ [unified_config] 数据库中没有数据源配置，使用硬编码配置")
+                print("[unified_config] no data source config in database, using fallback config")
         except Exception as e:
-            print(f"⚠️ [unified_config] 从数据库读取数据源配置失败: {e}，使用硬编码配置")
+            print(f"[unified_config] failed to load data source config from database: {e}; using fallback config")
 
         # 🔥 回退到硬编码配置（兼容性）
         settings = self.get_system_settings()

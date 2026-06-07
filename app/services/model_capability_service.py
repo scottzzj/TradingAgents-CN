@@ -97,19 +97,68 @@ class ModelCapabilityService:
         """
         # 1. 优先从数据库配置读取
         try:
+            requested_model = (model_name or "").lower()
             llm_configs = unified_config.get_llm_configs()
             for config in llm_configs:
-                if config.model_name == model_name:
+                if (config.model_name or "").lower() == requested_model:
                     return getattr(config, 'capability_level', 2)
         except Exception as e:
             logger.warning(f"从配置读取模型能力失败: {e}")
 
-        # 2. 从默认映射表读取（支持聚合渠道映射）
+        # 2. 从完整配置读取，包含 model_catalog 中用户新增的自定义模型。
+        catalog_config = self.get_model_config(model_name)
+        if catalog_config:
+            return catalog_config.get("capability_level", 2)
+
+        # 3. 从默认映射表读取（支持聚合渠道映射）
         capability, mapped_model = self._get_model_capability_with_mapping(model_name)
         if mapped_model:
             logger.info(f"✅ 使用映射模型 {mapped_model} 的能力等级: {capability}")
 
         return capability
+
+    def _coerce_features(self, features: List[Any]) -> List[ModelFeature]:
+        """把配置中的字符串特性安全转换成 ModelFeature 枚举。"""
+        features_enum = []
+        for feature in features or []:
+            if isinstance(feature, ModelFeature):
+                features_enum.append(feature)
+                continue
+            try:
+                features_enum.append(ModelFeature(str(feature)))
+            except ValueError:
+                logger.warning(f"⚠️ 未知的特性值: {feature}")
+        return features_enum
+
+    def _coerce_roles(self, roles: List[Any]) -> List[ModelRole]:
+        """把配置中的字符串角色安全转换成 ModelRole 枚举。"""
+        roles_enum = []
+        for role in roles or []:
+            if isinstance(role, ModelRole):
+                roles_enum.append(role)
+                continue
+            try:
+                roles_enum.append(ModelRole(str(role)))
+            except ValueError:
+                logger.warning(f"⚠️ 未知的角色值: {role}")
+        return roles_enum or [ModelRole.BOTH]
+
+    def _build_catalog_model_config(self, model_name: str, catalog_model: Dict[str, Any]) -> Dict[str, Any]:
+        """从模型目录记录生成能力配置，供用户在配置管理中新建的模型使用。"""
+        raw_features = catalog_model.get("features") or catalog_model.get("capabilities") or []
+        features = self._coerce_features(raw_features)
+        if not features:
+            features = [ModelFeature.TOOL_CALLING, ModelFeature.LONG_CONTEXT, ModelFeature.REASONING]
+
+        return {
+            "model_name": catalog_model.get("name") or model_name,
+            "model_display_name": catalog_model.get("display_name") or catalog_model.get("name") or model_name,
+            "capability_level": catalog_model.get("capability_level", 5 if "gpt" in model_name.lower() else 2),
+            "suitable_roles": self._coerce_roles(catalog_model.get("suitable_roles") or [ModelRole.BOTH.value]),
+            "features": features,
+            "recommended_depths": catalog_model.get("recommended_depths") or ["快速", "基础", "标准", "深度", "全面"],
+            "performance_metrics": catalog_model.get("performance_metrics") or {"speed": 3, "cost": 3, "quality": 5},
+        }
     
     def get_model_config(self, model_name: str) -> Dict[str, Any]:
         """
@@ -143,32 +192,15 @@ class ModelCapabilityService:
                 llm_configs = doc["llm_configs"]
                 logger.info(f"🔍 [MongoDB] llm_configs 数量: {len(llm_configs)}")
 
+                requested_model = (model_name or "").lower()
                 for config_dict in llm_configs:
-                    if config_dict.get("model_name") == model_name:
+                    if (config_dict.get("model_name") or "").lower() == requested_model:
                         logger.info(f"🔍 [MongoDB] 找到模型配置: {model_name}")
                         # 🔧 将字符串列表转换为枚举列表
-                        features_str = config_dict.get('features', [])
-                        features_enum = []
-                        for feature_str in features_str:
-                            try:
-                                # 将字符串转换为 ModelFeature 枚举
-                                features_enum.append(ModelFeature(feature_str))
-                            except ValueError:
-                                logger.warning(f"⚠️ 未知的特性值: {feature_str}")
+                        features_enum = self._coerce_features(config_dict.get('features', []))
 
                         # 🔧 将字符串列表转换为枚举列表
-                        roles_str = config_dict.get('suitable_roles', ["both"])
-                        roles_enum = []
-                        for role_str in roles_str:
-                            try:
-                                # 将字符串转换为 ModelRole 枚举
-                                roles_enum.append(ModelRole(role_str))
-                            except ValueError:
-                                logger.warning(f"⚠️ 未知的角色值: {role_str}")
-
-                        # 如果没有角色，默认为 both
-                        if not roles_enum:
-                            roles_enum = [ModelRole.BOTH]
+                        roles_enum = self._coerce_roles(config_dict.get('suitable_roles', ["both"]))
 
                         logger.info(f"📊 [MongoDB配置] {model_name}: features={features_enum}, roles={roles_enum}")
 
@@ -184,6 +216,25 @@ class ModelCapabilityService:
                             "performance_metrics": config_dict.get('performance_metrics', None)
                         }
 
+            catalog_doc = db.model_catalog.find_one(
+                {
+                    "models": {
+                        "$elemMatch": {
+                            "$or": [
+                                {"name": {"$regex": f"^{re.escape(model_name)}$", "$options": "i"}},
+                                {"id": {"$regex": f"^{re.escape(model_name)}$", "$options": "i"}},
+                            ]
+                        }
+                    }
+                },
+                {"models.$": 1}
+            )
+            if catalog_doc and catalog_doc.get("models"):
+                catalog_config = self._build_catalog_model_config(model_name, catalog_doc["models"][0])
+                logger.info(f"🔍 [MongoDB] 从模型目录找到模型配置: {model_name}")
+                client.close()
+                return catalog_config
+
             # 关闭连接
             client.close()
 
@@ -191,8 +242,14 @@ class ModelCapabilityService:
             logger.warning(f"从 MongoDB 读取模型信息失败: {e}", exc_info=True)
 
         # 2. 从默认映射表读取（直接匹配）
-        if model_name in DEFAULT_MODEL_CAPABILITIES:
-            return DEFAULT_MODEL_CAPABILITIES[model_name]
+        default_model_key = next(
+            (key for key in DEFAULT_MODEL_CAPABILITIES if key.lower() == (model_name or "").lower()),
+            None,
+        )
+        if default_model_key:
+            config = DEFAULT_MODEL_CAPABILITIES[default_model_key].copy()
+            config["model_name"] = model_name
+            return config
 
         # 3. 尝试聚合渠道模型映射
         provider, original_model = self._parse_aggregator_model_name(model_name)
@@ -428,4 +485,3 @@ def get_model_capability_service() -> ModelCapabilityService:
     if _model_capability_service is None:
         _model_capability_service = ModelCapabilityService()
     return _model_capability_service
-

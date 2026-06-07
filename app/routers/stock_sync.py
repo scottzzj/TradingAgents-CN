@@ -773,29 +773,32 @@ async def get_sync_status(
         
         db = get_mongo_db()
         
-        # 查询历史数据最后同步时间
-        hist_doc = await db.historical_data.find_one(
-            {"symbol": symbol},
-            sort=[("date", -1)]
+        symbol6 = str(symbol).zfill(6)
+        symbol_query = {"$or": [{"symbol": symbol6}, {"code": symbol6}]}
+
+        # 历史行情统一保存在 stock_daily_quotes 集合中。
+        hist_doc = await db.stock_daily_quotes.find_one(
+            symbol_query,
+            sort=[("trade_date", -1)]
         )
         
         # 查询财务数据最后同步时间
         fin_doc = await db.stock_financial_data.find_one(
-            {"symbol": symbol},
+            symbol_query,
             sort=[("updated_at", -1)]
         )
         
         # 统计历史数据条数
-        hist_count = await db.historical_data.count_documents({"symbol": symbol})
+        hist_count = await db.stock_daily_quotes.count_documents(symbol_query)
         
         # 统计财务数据条数
-        fin_count = await db.stock_financial_data.count_documents({"symbol": symbol})
+        fin_count = await db.stock_financial_data.count_documents(symbol_query)
         
         return ok(data={
-            "symbol": symbol,
+            "symbol": symbol6,
             "historical_data": {
                 "last_sync": hist_doc.get("updated_at") if hist_doc else None,
-                "last_date": hist_doc.get("date") if hist_doc else None,
+                "last_date": hist_doc.get("trade_date") if hist_doc else None,
                 "total_records": hist_count
             },
             "financial_data": {
@@ -808,4 +811,3 @@ async def get_sync_status(
     except Exception as e:
         logger.error(f"❌ 获取同步状态失败: {e}")
         raise HTTPException(status_code=500, detail=f"获取同步状态失败: {str(e)}")
-

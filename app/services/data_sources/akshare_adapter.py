@@ -105,6 +105,32 @@ class AKShareAdapter(DataSourceAdapter):
             df['industry'] = ''
             df['list_date'] = ''
 
+            # 北交所 920xxx 股票在 stock_info_a_code_name 中只有代码和名称；
+            # stock_info_bj_name_code 提供所属行业、地区和上市日期，用它补齐筛选依赖字段。
+            try:
+                bj_df = ak.stock_info_bj_name_code()
+                if bj_df is not None and not bj_df.empty:
+                    bj_df = bj_df.rename(columns={
+                        '证券代码': 'symbol',
+                        '证券简称': 'name',
+                        '所属行业': 'industry',
+                        '地区': 'area',
+                        '上市日期': 'list_date',
+                    })
+                    required_cols = {'symbol', 'industry', 'area', 'list_date'}
+                    if required_cols.issubset(set(bj_df.columns)):
+                        bj_df['symbol'] = bj_df['symbol'].astype(str).str.zfill(6)
+                        bj_profiles = bj_df.set_index('symbol')[['industry', 'area', 'list_date']]
+                        bj_mask = df['symbol'].astype(str).str.zfill(6).isin(bj_profiles.index)
+
+                        for field in ['industry', 'area', 'list_date']:
+                            mapped = df.loc[bj_mask, 'symbol'].astype(str).str.zfill(6).map(bj_profiles[field])
+                            df.loc[bj_mask, field] = mapped.fillna(df.loc[bj_mask, field])
+
+                        logger.info(f"AKShare: Enriched {int(bj_mask.sum())} BJ stocks with industry/area/list_date")
+            except Exception as e:
+                logger.warning(f"AKShare: Failed to enrich BJ stock profiles: {e}")
+
             logger.info(f"AKShare: Successfully fetched {len(df)} stocks with real names")
             return df
 
@@ -389,4 +415,3 @@ class AKShareAdapter(DataSourceAdapter):
         yesterday = (datetime.now() - timedelta(days=1)).strftime("%Y%m%d")
         logger.info(f"AKShare: Using yesterday as trade date: {yesterday}")
         return yesterday
-
