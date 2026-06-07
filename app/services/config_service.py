@@ -3397,7 +3397,16 @@ class ConfigService:
             elif provider_name == "openrouter":
                 return await asyncio.get_event_loop().run_in_executor(None, self._test_openrouter_api, api_key, display_name)
             elif provider_name == "openai":
-                return await asyncio.get_event_loop().run_in_executor(None, self._test_openai_api, api_key, display_name)
+                db = await self._get_db()
+                providers_collection = db.llm_providers
+                provider_data = await providers_collection.find_one({"name": provider_name})
+                base_url = provider_data.get("default_base_url") if provider_data else None
+                catalog_data = await db.model_catalog.find_one({"provider": provider_name})
+                test_model = self._get_first_catalog_model_name(catalog_data)
+                # OpenAI 厂家可能配置为兼容中转地址，连通性测试必须使用后台保存的默认地址。
+                return await asyncio.get_event_loop().run_in_executor(
+                    None, self._test_openai_compatible_api, api_key, display_name, base_url, provider_name, test_model
+                )
             elif provider_name == "anthropic":
                 return await asyncio.get_event_loop().run_in_executor(None, self._test_anthropic_api, api_key, display_name)
             elif provider_name == "qianfan":
@@ -4580,7 +4589,20 @@ class ConfigService:
 
         return filtered
 
-    def _test_openai_compatible_api(self, api_key: str, display_name: str, base_url: str = None, provider_name: str = None) -> dict:
+    def _get_first_catalog_model_name(self, catalog_data: Optional[dict]) -> Optional[str]:
+        """获取模型目录中第一个可用模型，用于厂家连通性测试。"""
+        if not catalog_data:
+            return None
+
+        for model in catalog_data.get("models") or []:
+            if model.get("is_deprecated"):
+                continue
+            model_name = model.get("name") or model.get("id")
+            if model_name:
+                return model_name
+        return None
+
+    def _test_openai_compatible_api(self, api_key: str, display_name: str, base_url: str = None, provider_name: str = None, model_name: str = None) -> dict:
         """测试 OpenAI 兼容 API（用于聚合渠道和自定义厂家）"""
         try:
             import requests
@@ -4616,7 +4638,9 @@ class ConfigService:
             }
 
             # 🔥 根据不同厂家选择合适的测试模型
-            test_model = "gpt-3.5-turbo"  # 默认模型
+            test_model = model_name or "gpt-3.5-turbo"  # 默认模型
+            if model_name:
+                logger.info(f"🔍 使用模型目录中的测试模型: {test_model}")
             if provider_name == "siliconflow":
                 # 硅基流动使用免费的 Qwen 模型进行测试
                 test_model = "Qwen/Qwen2.5-7B-Instruct"
